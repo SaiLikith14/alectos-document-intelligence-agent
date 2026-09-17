@@ -294,6 +294,12 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
             async def stream():
                 status = 'uncertain'
                 saw_text = False
+                # Emit a comment before contacting the upstream. Waking a sleeping
+                # service and waiting on the first model token can take a minute,
+                # and a response that sends nothing for that long is liable to be
+                # dropped by an intermediary. A comment is valid SSE that carries
+                # no event, so clients ignore it.
+                yield ': connected\n\n'
                 try:
                     async with asyncio.timeout(config.gateway_timeout_seconds):
                         async with request.app.state.research.stream(
