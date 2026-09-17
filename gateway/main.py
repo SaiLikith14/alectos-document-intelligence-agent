@@ -18,6 +18,7 @@ from gateway.store import Store
 from gateway.streaming import event, iter_events
 
 AGENT = 'document-intelligence'
+RESEARCH_AGENT = 'research-agent'
 log = logging.getLogger(__name__)
 
 
@@ -26,6 +27,11 @@ class Query(BaseModel):
     question: str = Field(min_length=1, max_length=10000)
     document_ids: list[UUID] = Field(min_length=1, max_length=50)
     top_k: int = Field(default=8, ge=1, le=20)
+
+
+class ResearchChat(BaseModel):
+    message: str = Field(min_length=1, max_length=10000)
+    conversation_id: str | None = Field(default=None, max_length=64)
 
 
 class SessionCreate(BaseModel):
@@ -73,6 +79,15 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
             limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
             follow_redirects=False,
         )
+        # The research backend authenticates with its own bearer key. Holding it
+        # here is the point: it must never be shipped to a browser.
+        app.state.research = httpx.AsyncClient(
+            base_url=config.research_backend_url.rstrip('/'),
+            headers={'Authorization': f'Bearer {config.research_backend_api_key}'},
+            timeout=httpx.Timeout(config.gateway_timeout_seconds, connect=10),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=5),
+            follow_redirects=False,
+        ) if config.research_enabled else None
         try:
             if store is None:
                 async with app.state.store.pool.acquire() as conn:
@@ -80,6 +95,7 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
             yield
         finally:
             if client is None: await app.state.client.aclose()
+            if app.state.research is not None: await app.state.research.aclose()
             if store is None: await app.state.store.pool.close()
 
     app = FastAPI(title='Alectos Gateway', lifespan=lifespan)
@@ -111,9 +127,13 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
     @app.get('/api/v1/health')
     async def health(): return {'status': 'ok', 'service': 'Alectos Gateway'}
 
+    agent_ids = [AGENT] + ([RESEARCH_AGENT] if config.research_enabled else [])
+
     @app.get('/api/v1/me/usage')
     async def usage(request: Request, user: str = Depends(current_user)):
-        return {'agents': [await request.app.state.store.usage(user, AGENT, config.trial_requests_per_agent, metered(user))]}
+        store = request.app.state.store
+        return {'agents': [await store.usage(user, name, config.trial_requests_per_agent, metered(user))
+                           for name in agent_ids]}
 
     @app.post('/api/v1/sessions', status_code=201)
     async def create_session(payload: SessionCreate, request: Request, user: str = Depends(current_user)):
@@ -159,11 +179,14 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
         if not payload.question.strip(): raise HTTPException(422, 'Question must not be blank')
         await request.app.state.store.reserve(user, AGENT, request_id, metered(user), config.trial_requests_per_agent)
 
-    async def finish(request, user, request_id, status):
+    async def finish_agent(request, user, agent, request_id, status):
         # Cleanup persists even if the browser disconnects. If persistence itself fails,
         # the original reservation stays blocked for explicit reconciliation.
         with anyio.CancelScope(shield=True):
-            await request.app.state.store.finish(user, AGENT, request_id, status)
+            await request.app.state.store.finish(user, agent, request_id, status)
+
+    async def finish(request, user, request_id, status):
+        await finish_agent(request, user, AGENT, request_id, status)
 
     @app.post('/api/v1/agents/document-intelligence/query')
     async def query(payload: Query, request: Request, user: str = Depends(current_user), request_id: UUID = Header(alias='Idempotency-Key')):
@@ -226,5 +249,89 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
         return StreamingResponse(stream(), media_type='text/event-stream',
                                  headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
                                  background=BackgroundTask(finish, request, user, request_id, 'uncertain'))
+
+
+    # ------------------------------------------------------------------
+    # Research agent (MCP). Registered only when a research backend is
+    # configured, so a deployment without it behaves exactly as before.
+    #
+    # Note: conversations in the research backend are not owned per user.
+    # Everyone signed in shares one thread list. Acceptable for a personal
+    # deployment; add a subject column there before opening it up.
+    # ------------------------------------------------------------------
+    if config.research_enabled:
+        async def research_json(request, method, path, **kwargs):
+            try:
+                async with asyncio.timeout(config.gateway_timeout_seconds):
+                    response = await request.app.state.research.request(method, path, **kwargs)
+            except (httpx.HTTPError, TimeoutError) as exc:
+                raise HTTPException(502, 'Research agent unavailable') from exc
+            if not response.is_success:
+                status = response.status_code if 400 <= response.status_code < 500 else 502
+                raise HTTPException(status, 'Research agent could not complete this request')
+            if response.status_code == 204: return None
+            try: return response.json()
+            except ValueError as exc: raise HTTPException(502, 'Invalid research agent response') from exc
+
+        @app.get('/api/v1/agents/research-agent/tools')
+        async def research_tools(request: Request, user: str = Depends(current_user)):
+            return await research_json(request, 'GET', '/api/tools')
+
+        @app.get('/api/v1/agents/research-agent/conversations')
+        async def research_conversations(request: Request, user: str = Depends(current_user)):
+            return await research_json(request, 'GET', '/api/conversations')
+
+        @app.get('/api/v1/agents/research-agent/conversations/{conversation_id}')
+        async def research_conversation(conversation_id: str, request: Request, user: str = Depends(current_user)):
+            return await research_json(request, 'GET', f'/api/conversations/{conversation_id}')
+
+        @app.post('/api/v1/agents/research-agent/chat/stream')
+        async def research_chat(payload: ResearchChat, request: Request, user: str = Depends(current_user),
+                                request_id: UUID = Header(alias='Idempotency-Key')):
+            if not payload.message.strip(): raise HTTPException(422, 'Message must not be blank')
+            await request.app.state.store.reserve(user, RESEARCH_AGENT, request_id, metered(user), config.trial_requests_per_agent)
+
+            async def stream():
+                status = 'uncertain'
+                saw_text = False
+                try:
+                    async with asyncio.timeout(config.gateway_timeout_seconds):
+                        async with request.app.state.research.stream(
+                            'POST', '/api/chat/stream', json=payload.model_dump()
+                        ) as response:
+                            if not response.is_success:
+                                status = 'failed' if response.status_code < 500 else 'uncertain'
+                                await finish_agent(request, user, RESEARCH_AGENT, request_id, status)
+                                yield event('error', {'detail': 'The research agent could not start.', 'code': 'upstream_error'})
+                                return
+                            if 'text/event-stream' not in response.headers.get('content-type', ''):
+                                raise ValueError('Unexpected stream type')
+                            async for name, data in iter_events(response.aiter_bytes()):
+                                if not isinstance(data, dict): raise ValueError('Invalid event payload')
+                                if name == 'text':
+                                    saw_text = saw_text or bool(str(data.get('text', '')).strip())
+                                if name == 'error':
+                                    status = 'failed'
+                                    await finish_agent(request, user, RESEARCH_AGENT, request_id, status)
+                                    yield event('error', {'detail': 'The agent could not complete the answer. Your trial allowance was released.', 'code': 'agent_error'})
+                                    return
+                                if name == 'done':
+                                    if not saw_text: raise ValueError('Empty answer')
+                                    await finish_agent(request, user, RESEARCH_AGENT, request_id, 'completed')
+                                    status = 'completed'
+                                    yield event(name, data)
+                                    return
+                                if name in {'conversation', 'text', 'tool_call', 'tool_result'}:
+                                    yield event(name, data)
+                            raise ValueError('Stream ended without done')
+                except Exception:
+                    yield event('error', {'detail': 'The response was interrupted. Check usage before retrying.', 'code': 'stream_interrupted'})
+                finally:
+                    if status != 'completed': await finish_agent(request, user, RESEARCH_AGENT, request_id, status)
+
+            from starlette.background import BackgroundTask
+            return StreamingResponse(stream(), media_type='text/event-stream',
+                                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+                                     background=BackgroundTask(finish_agent, request, user, RESEARCH_AGENT, request_id, 'uncertain'))
 
     return app

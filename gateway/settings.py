@@ -8,6 +8,10 @@ class GatewaySettings(BaseSettings):
     database_url: str
     backend_url: str = 'http://127.0.0.1:8000'
     backend_gateway_secret: str = Field(min_length=32)
+    # Research agent (MCP). Left blank, its routes are simply not registered,
+    # so the gateway still runs with only the document agent deployed.
+    research_backend_url: str = ''
+    research_backend_api_key: str = ''
     auth_issuer: str
     auth_audience: str
     auth_jwks_url: str
@@ -26,14 +30,23 @@ class GatewaySettings(BaseSettings):
         for name in ('auth_issuer', 'auth_jwks_url'):
             if urlparse(getattr(self, name)).scheme != 'https':
                 raise ValueError(f'{name} must use HTTPS')
-        url = urlparse(self.backend_url)
-        if url.scheme not in {'https', 'http'} or not url.hostname or url.username or url.password or url.query or url.fragment:
-            raise ValueError('BACKEND_URL must be a fixed HTTP(S) server URL')
-        if url.path not in {'', '/'}:
-            raise ValueError('BACKEND_URL must not contain a path')
+        for name in ('backend_url', 'research_backend_url'):
+            raw = getattr(self, name)
+            if not raw:
+                continue
+            url = urlparse(raw)
+            if url.scheme not in {'https', 'http'} or not url.hostname or url.username or url.password or url.query or url.fragment:
+                raise ValueError(f'{name.upper()} must be a fixed HTTP(S) server URL')
+            if url.path not in {'', '/'}:
+                raise ValueError(f'{name.upper()} must not contain a path')
+        if self.research_backend_url and not self.research_backend_api_key:
+            raise ValueError('RESEARCH_BACKEND_API_KEY is required when RESEARCH_BACKEND_URL is set')
         if not self.auth_audience.strip():
             raise ValueError('AUTH_AUDIENCE must not be empty')
         return self
+
+    @property
+    def research_enabled(self): return bool(self.research_backend_url)
 
     @property
     def admins(self): return {s.strip() for s in self.admin_subjects.split(',') if s.strip()}
