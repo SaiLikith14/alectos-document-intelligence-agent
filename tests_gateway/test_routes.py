@@ -17,7 +17,7 @@ class MemoryStore:
         validate_owned_resources([r for r in self.resources if r['subject']==user],ids,session_id)
     async def own(self,user,kind,resource_id,session_id=None):
         self.resources.append(dict(subject=user,kind=kind,resource_id=resource_id,session_id=session_id))
-    async def reserve(self,user,agent,request_id,metered,allowance):
+    async def reserve(self,user,agent,request_id,metered,allowance,stale_after=180):
         if request_id in self.requests: raise HTTPException(409,'Duplicate')
         self.requests[request_id] = {'status':'reserved','metered':metered}
     async def finish(self,user,agent,request_id,status):
