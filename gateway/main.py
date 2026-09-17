@@ -177,7 +177,7 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
     async def reserve(request, payload, user, request_id):
         await request.app.state.store.check_scope(user, payload.document_ids, payload.session_id)
         if not payload.question.strip(): raise HTTPException(422, 'Question must not be blank')
-        await request.app.state.store.reserve(user, AGENT, request_id, metered(user), config.trial_requests_per_agent)
+        await request.app.state.store.reserve(user, AGENT, request_id, metered(user), config.trial_requests_per_agent, config.gateway_timeout_seconds)
 
     async def finish_agent(request, user, agent, request_id, status):
         # Cleanup persists even if the browser disconnects. If persistence itself fails,
@@ -289,7 +289,7 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
         async def research_chat(payload: ResearchChat, request: Request, user: str = Depends(current_user),
                                 request_id: UUID = Header(alias='Idempotency-Key')):
             if not payload.message.strip(): raise HTTPException(422, 'Message must not be blank')
-            await request.app.state.store.reserve(user, RESEARCH_AGENT, request_id, metered(user), config.trial_requests_per_agent)
+            await request.app.state.store.reserve(user, RESEARCH_AGENT, request_id, metered(user), config.trial_requests_per_agent, config.gateway_timeout_seconds)
 
             async def stream():
                 status = 'uncertain'

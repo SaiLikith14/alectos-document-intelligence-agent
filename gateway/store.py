@@ -53,13 +53,23 @@ class Store:
             if document_id:
                 await conn.execute("INSERT INTO gateway_resources(kind,resource_id,subject,session_id) VALUES('document',$1,$2,$3)", UUID(str(document_id)), subject, row['session_id'])
 
-    async def reserve(self, subject, agent, request_id, metered, allowance):
+    async def reserve(self, subject, agent, request_id, metered, allowance, stale_after=180):
         async with self.locked_user(subject) as conn:
             existing = await conn.fetchval('SELECT status FROM gateway_requests WHERE subject=$1 AND agent=$2 AND request_id=$3', subject, agent, request_id)
             if existing:
                 raise HTTPException(409, {'code': 'duplicate_request', 'status': existing, 'message': 'This request ID has already been used. No new run was started.'})
-            # One active request per user/agent even in testing mode.
-            active = await conn.fetchval("SELECT count(*) FROM gateway_requests WHERE subject=$1 AND agent=$2 AND status IN ('reserved','uncertain')", subject, agent)
+            # One active request per user/agent even in testing mode. A row only
+            # blocks while the run it represents could still be going: past the
+            # gateway's own timeout the upstream call has certainly ended, and a
+            # row abandoned at 'uncertain' would otherwise wedge the agent
+            # permanently with no way to clear it. Allowance accounting below is
+            # unaffected — it counts 'uncertain' regardless of age, so nothing is
+            # silently refunded.
+            active = await conn.fetchval(
+                "SELECT count(*) FROM gateway_requests WHERE subject=$1 AND agent=$2 "
+                "AND status IN ('reserved','uncertain') "
+                "AND updated_at > now() - make_interval(secs => $3::double precision)",
+                subject, agent, float(stale_after))
             if active: raise HTTPException(409, {'code': 'request_pending', 'message': 'A request is active or needs reconciliation.'})
             if metered:
                 count = await conn.fetchval("SELECT count(*) FROM gateway_requests WHERE subject=$1 AND agent=$2 AND metered AND status IN ('reserved','completed','uncertain')", subject, agent)
