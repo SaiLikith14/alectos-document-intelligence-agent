@@ -1,83 +1,141 @@
-# Alectos Document Intelligence Backend
+# Alectos Document Intelligence
 
-FastAPI backend for a document-intelligence RAG agent using PostgreSQL + pgvector, Gemini embeddings, PostgreSQL full-text search, Reciprocal Rank Fusion, and Gemini answer generation.
+A document-intelligence RAG agent: PostgreSQL + pgvector, Gemini embeddings, PostgreSQL
+full-text search, Reciprocal Rank Fusion, and Gemini answer generation — behind an
+authentication gateway that verifies Firebase ID tokens and scopes every document to the
+user who uploaded it.
 
-## 1. Prerequisites
+## Architecture
+
+```
+browser ──► gateway ──────────────► backend ──► Postgres + Gemini
+            verifies Firebase       refuses any request that
+            ID tokens, enforces     does not carry the shared
+            ownership, meters       secret header
+            trial usage
+```
+
+Two services, one database:
+
+| | Port | Faces | Role |
+|---|---|---|---|
+| **gateway** (`gateway/`) | 8001 | the browser | Verifies RS256 Firebase tokens against JWKS, enforces per-user ownership of sessions and documents, meters trial usage with idempotency keys, proxies to the backend |
+| **backend** (`app/`) | 8000 | the gateway only | Ingestion, chunking, embeddings, hybrid retrieval, answer generation |
+
+`GatewayOnlyMiddleware` rejects any request to the backend that lacks
+`X-Alectos-Gateway-Key`, so the backend is never callable from a browser even when it is
+reachable on the network. `/api/v1/health` is the single exception.
+
+## Documentation
+
+| Document | Covers |
+|---|---|
+| [GATEWAY_SETUP.md](GATEWAY_SETUP.md) | Configuring the gateway, auth issuer, and shared secret |
+| [RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md) | Deploying both services and Postgres to Render |
+| [FRONTEND_INSTRUCTIONS.md](FRONTEND_INSTRUCTIONS.md) | The contract a frontend must honour |
+| [VERIFICATION.md](VERIFICATION.md) | What was tested and how |
+| [UPGRADE_GUIDE.md](UPGRADE_GUIDE.md) | Moving from the pre-gateway version |
+
+## Prerequisites
+
 - Python 3.12+
 - Docker Desktop
-- VS Code
 - A Gemini API key
+- A Firebase project with Google sign-in enabled
 
-## 2. Quick start with Docker
+## Running locally
+
+### 1. Configuration
+
 ```bash
-cp .env.example .env
-# Add GEMINI_API_KEY to .env if you want a server-side key
-
-docker compose up --build
+cp .env.example .env              # backend
+cp .gateway.env.example .gateway.env   # gateway
 ```
 
-Open:
-- API docs: http://localhost:8000/docs
-- Health: http://localhost:8000/api/v1/health
+Generate a shared secret and put the **same value** in both files:
 
-## 3. Local Python + Docker database
-Start only PostgreSQL:
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+In `.gateway.env`, set `AUTH_ISSUER` to
+`https://securetoken.google.com/<firebase-project-id>` and `AUTH_AUDIENCE` to the
+project ID itself.
+
+### 2. Docker Compose
+
+```bash
+docker compose -f docker-compose.gateway.yml up --build
+```
+
+This brings up Postgres, the backend, the gateway schema migration, and the gateway.
+Only the gateway is published, on `localhost:8001`.
+
+### 3. Or run the services directly
+
 ```bash
 docker compose up -d db
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-gateway.txt
+python -m gateway.migrate
 ```
 
-Create a virtual environment:
+Then, in two terminals:
+
 ```bash
-python -m venv .venv
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --env-file .env
 ```
 
-macOS/Linux:
 ```bash
-source .venv/bin/activate
+uvicorn gateway.main:create_gateway --factory --host 0.0.0.0 --port 8001
 ```
 
-Windows PowerShell:
-```powershell
-.venv\Scripts\Activate.ps1
-```
+> `--env-file .env` is required. `GatewayOnlyMiddleware` reads
+> `BACKEND_GATEWAY_SECRET` from the process environment, not from the settings file, so
+> without it every request returns `503 Gateway protection is not configured`.
 
-Install dependencies:
+Verify:
+
 ```bash
-pip install -r requirements.txt
+curl http://localhost:8001/api/v1/health
 ```
 
-Copy env file and run:
+## API
+
+Every endpoint below is served by the **gateway** and requires
+`Authorization: Bearer <firebase-id-token>`.
+
+### Create a session
+
 ```bash
-cp .env.example .env
-uvicorn app.main:app --reload
-```
-
-## 4. BYOK from your UI
-Send the user's Gemini key only in the request header:
-```text
-X-Gemini-API-Key: <user-key>
-```
-The application does not persist this header value.
-
-## 5. Create a session
-```bash
-curl -X POST http://localhost:8000/api/v1/sessions \
+curl -X POST http://localhost:8001/api/v1/sessions \
+  -H "Authorization: Bearer $ID_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"title":"My document chat"}'
 ```
 
-## 6. Upload a document
+### Upload a document
+
+PDF and TXT only, `GATEWAY_MAX_UPLOAD_MB` cap, `GATEWAY_MAX_DOCUMENTS_PER_USER` per user.
+
 ```bash
-curl -X POST http://localhost:8000/api/v1/documents/upload \
-  -H 'X-Gemini-API-Key: YOUR_KEY' \
-  -F 'file=@sample.pdf'
+curl -X POST http://localhost:8001/api/v1/documents/upload \
+  -H "Authorization: Bearer $ID_TOKEN" \
+  -F 'file=@sample.pdf' \
+  -F "session_id=$SESSION_ID"
 ```
 
-## 7. Query the document agent
+### Query
+
+`Idempotency-Key` is required and must be a UUID. Reusing a key for a different question
+is rejected rather than silently re-run, so a retried request can never consume a second
+trial allowance.
+
 ```bash
-curl -X POST http://localhost:8000/api/v1/agents/document-intelligence/query \
+curl -X POST http://localhost:8001/api/v1/agents/document-intelligence/query \
+  -H "Authorization: Bearer $ID_TOKEN" \
   -H 'Content-Type: application/json' \
-  -H 'X-Gemini-API-Key: YOUR_KEY' \
+  -H "Idempotency-Key: $(uuidgen)" \
   -d '{
     "question":"Summarize the main risks",
     "document_ids":["YOUR_DOCUMENT_UUID"],
@@ -85,26 +143,33 @@ curl -X POST http://localhost:8000/api/v1/agents/document-intelligence/query \
   }'
 ```
 
-## 8. Frontend contract
-Upload:
-- `POST /api/v1/documents/upload`
-- multipart form field: `file`
-- optional form field: `session_id`
+### Usage
 
-Query:
-- `POST /api/v1/agents/document-intelligence/query`
-- JSON: `question`, `document_ids`, optional `session_id`, optional `top_k`
+```bash
+curl http://localhost:8001/api/v1/me/usage -H "Authorization: Bearer $ID_TOKEN"
+```
 
-## Notes
-This first version supports PDF and TXT ingestion. Local files are stored in `uploads/`. Replace this with object storage before production if needed.
+```json
+{
+  "agents": [
+    {
+      "agent": "document-intelligence",
+      "trial_enforced": false,
+      "remaining": null,
+      "pending_requests": []
+    }
+  ]
+}
+```
 
-## Hardened API contract
+`remaining` is `null` when trial enforcement is off. `pending_requests` is a **list**, not
+a count — a non-empty list means a run is still in flight and a new one will be refused.
+
+## Response contract
 
 ### Non-streaming query
 
-`POST /api/v1/agents/document-intelligence/query`
-
-Returns Markdown separately from citation metadata:
+Markdown is returned separately from citation metadata:
 
 ```json
 {
@@ -120,41 +185,65 @@ Returns Markdown separately from citation metadata:
       "excerpt": "..."
     }
   ],
-  "run": {
-    "id": "...",
-    "agent": "document-intelligence",
-    "latency_ms": 842.4
-  },
-  "retrieval": {
-    "sources_used": 3
-  }
+  "run": { "id": "...", "agent": "document-intelligence", "latency_ms": 842.4 },
+  "retrieval": { "sources_used": 3 }
 }
 ```
 
-Render `answer_markdown` in the frontend with a Markdown renderer. Keep typography, spacing, citation pills, source cards, copy buttons, and responsive layout in the UI layer.
+Render `answer_markdown` with a Markdown renderer. Typography, citation pills, source
+cards, and layout belong to the UI layer.
 
 ### Streaming query
 
-`POST /api/v1/agents/document-intelligence/query/stream`
+`POST /api/v1/agents/document-intelligence/query/stream` returns Server-Sent Events over
+a streamed POST response — read `fetch()`'s response body stream.
 
-The response uses Server-Sent Events over a streamed POST response. A frontend should read the `fetch()` response body stream. Event types are:
+| Event | Payload |
+|---|---|
+| `meta` | run metadata, retrieval count, citations |
+| `token` | one Markdown delta in `data.delta` |
+| `done` | run ID and final latency |
+| `error` | safe detail plus a machine-readable `code` |
 
-- `meta`: run metadata, retrieval count, and citations
-- `token`: one generated Markdown delta in `data.delta`
-- `done`: run ID and final latency
-- `error`: safe error detail and machine-readable error code
+Treat only `done` as success. A stream that ends without it was interrupted, and the
+gateway releases the trial reservation in that case.
 
-### Error behavior
+### Status codes
 
-- Missing Gemini key: `401`
-- Missing session or document: `404`
-- Unsupported upload: `400`
-- Oversized upload: `413`
-- Gemini upstream/rate-limit failures: `502`
-- Unexpected server failures: `500` with a safe generic message
+| Code | Meaning |
+|---|---|
+| `401` | Missing, expired, or invalid ID token |
+| `403` | Trial allowance exhausted (`code: trial_exhausted`), subject blocked, document allowance reached, or resource owned by another user |
+| `404` | Session or document not found |
+| `409` | Duplicate idempotency key, or another run still pending |
+| `413` | Upload exceeds the configured limit |
+| `422` | Malformed payload |
+| `502` | Backend or Gemini upstream failure |
+| `503` | Gateway misconfigured — usually a missing shared secret |
 
-Invalid session/document IDs are validated before agent-run creation, so PostgreSQL foreign-key errors are not exposed to the client.
+Invalid session and document IDs are validated before an agent run is created, so
+PostgreSQL foreign-key errors never reach the client.
 
-### Failed upload behavior
+## Behaviour worth knowing
 
-Document creation and chunk insertion stay in one transaction until ingestion succeeds. If extraction, embedding, or indexing fails, the transaction is rolled back and the uploaded temporary file is removed.
+**Uploads are transactional.** Document creation and chunk insertion stay in one
+transaction until ingestion succeeds. If extraction, embedding, or indexing fails, the
+transaction rolls back and the temporary file is removed.
+
+**Trial accounting survives disconnects.** Reservations are released in a shielded
+cancel scope, so a browser that closes mid-stream still frees the allowance. If the
+release itself fails, the reservation stays blocked deliberately, for an operator to
+reconcile rather than silently granting a free run.
+
+**The Gemini key is server-side only.** Earlier versions accepted a per-request
+`X-Gemini-API-Key` header from the browser. The gateway does not forward it, so
+`GEMINI_API_KEY` must be configured on the backend. Never expose a provider key to a
+frontend.
+
+**Local files are incidental.** PDFs are parsed into chunks and embeddings at upload
+time; every later query reads those rows from Postgres. The file in `uploads/` is not
+consulted again.
+
+## License
+
+See [LICENSE](LICENSE).

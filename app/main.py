@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from app.core.gateway_auth import GatewayOnlyMiddleware
+
 import app.models  # noqa: F401 - register all SQLAlchemy models
 from app.api.v1.router import api_router
 from app.core.config import get_settings
@@ -55,6 +57,10 @@ app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
 )
+
+
+# Outermost: direct clients cannot bypass the public gateway.
+app.add_middleware(GatewayOnlyMiddleware)
 
 
 @app.exception_handler(AlectosError)

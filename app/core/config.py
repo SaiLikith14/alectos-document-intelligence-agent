@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +19,18 @@ class Settings(BaseSettings):
     rrf_k: int = 60
 
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+
+    @field_validator('database_url')
+    @classmethod
+    def use_async_driver(cls, value: str) -> str:
+        # Managed hosts (Render, Heroku, Supabase) hand out sync DSNs. SQLAlchemy's
+        # async engine needs the asyncpg driver spelled out, so normalise it here
+        # rather than making every deployment remember to rewrite the scheme.
+        if value.startswith('postgres://'):
+            return value.replace('postgres://', 'postgresql+asyncpg://', 1)
+        if value.startswith('postgresql://'):
+            return value.replace('postgresql://', 'postgresql+asyncpg://', 1)
+        return value
 
     @property
     def cors_origin_list(self) -> list[str]:

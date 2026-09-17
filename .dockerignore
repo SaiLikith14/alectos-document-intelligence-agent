@@ -1,0 +1,14 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.DS_Store
+__MACOSX
+.env
+.env.*
+.gateway.env
+.gateway.env.*
+uploads
+*.zip

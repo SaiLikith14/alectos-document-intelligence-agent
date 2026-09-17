@@ -1,0 +1,59 @@
+# Optional local setup. Run standalone, not as an overlay on docker-compose.yml.
+# Reuses the existing Compose project's postgres_data volume if the project name is unchanged.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: alectos
+      POSTGRES_USER: alectos
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:?Set LOCAL_DB_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alectos -d alectos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://alectos:${LOCAL_DB_PASSWORD}@db:5432/alectos
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env}
+      BACKEND_GATEWAY_SECRET: ${BACKEND_GATEWAY_SECRET:?Set BACKEND_GATEWAY_SECRET in .env}
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+  gateway-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    env_file: .gateway.env
+    environment:
+      DATABASE_URL: postgresql://alectos:${LOCAL_DB_PASSWORD}@db:5432/alectos
+      BACKEND_URL: http://api:8000
+      BACKEND_GATEWAY_SECRET: ${BACKEND_GATEWAY_SECRET}
+    command: ["python", "-m", "gateway.migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    env_file: .gateway.env
+    environment:
+      DATABASE_URL: postgresql://alectos:${LOCAL_DB_PASSWORD}@db:5432/alectos
+      BACKEND_URL: http://api:8000
+      BACKEND_GATEWAY_SECRET: ${BACKEND_GATEWAY_SECRET}
+    ports:
+      - "8001:8001"
+    depends_on:
+      gateway-migrate:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+volumes:
+  postgres_data:

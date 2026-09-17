@@ -1,0 +1,103 @@
+# Render Blueprint — deploys the RAG backend, the auth gateway, and Postgres.
+#
+# Topology: browser -> gateway (public, verifies Firebase ID tokens)
+#                   -> backend (rejects any request without the shared secret)
+#
+# Both run as web services because Render's free tier has no private networking.
+# The backend stays protected by GatewayOnlyMiddleware, which refuses every
+# request that does not carry X-Alectos-Gateway-Key.
+#
+# Values marked sync:false are NOT in this file. Render prompts for them on
+# first deploy, and they never enter version control.
+databases:
+  - name: alectos-db
+    databaseName: alectos
+    user: alectos
+    plan: free
+    postgresMajorVersion: "16"   # pgvector ships with Render Postgres 16
+
+services:
+  # ----------------------------------------------------------------------
+  # RAG backend — private in practice, reachable only with the shared secret
+  # ----------------------------------------------------------------------
+  - type: web
+    name: alectos-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: alectos-db
+          property: connectionString
+      - key: BACKEND_GATEWAY_SECRET
+        generateValue: true          # generated once, shared with the gateway below
+      - key: GEMINI_API_KEY
+        sync: false                  # paste your key in the Render dashboard
+      - key: APP_ENV
+        value: production
+      - key: GEMINI_GENERATION_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-2
+      - key: EMBEDDING_DIMENSIONS
+        value: "768"
+      - key: UPLOAD_DIR
+        value: /tmp/uploads          # ephemeral by design; see note in RENDER_DEPLOYMENT.md
+      - key: MAX_UPLOAD_MB
+        value: "20"
+      - key: DEFAULT_TOP_K
+        value: "8"
+      - key: RRF_K
+        value: "60"
+      - key: CORS_ORIGINS
+        value: https://localhost     # backend is never called by a browser
+
+  # ----------------------------------------------------------------------
+  # Auth gateway — the only service the frontend talks to
+  # ----------------------------------------------------------------------
+  - type: web
+    name: alectos-gateway
+    runtime: docker
+    dockerfilePath: ./Dockerfile.gateway
+    plan: free
+    region: oregon
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: alectos-db
+          property: connectionString
+      - key: BACKEND_URL
+        sync: false                  # https://alectos-backend.onrender.com (scheme required,
+                                     # no trailing path). Render exposes no URL property for
+                                     # fromService, so paste it once the backend is live.
+      - key: BACKEND_GATEWAY_SECRET
+        fromService:
+          name: alectos-backend
+          type: web
+          envVarKey: BACKEND_GATEWAY_SECRET
+      - key: AUTH_ISSUER
+        sync: false                  # https://securetoken.google.com/<firebase-project-id>
+      - key: AUTH_AUDIENCE
+        sync: false                  # <firebase-project-id>
+      - key: AUTH_JWKS_URL
+        value: https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com
+      - key: CORS_ORIGINS
+        sync: false                  # your deployed frontend origin, comma-separated
+      - key: ADMIN_SUBJECTS
+        value: ""                    # Firebase UIDs exempt from the trial counter
+      - key: BLOCKED_SUBJECTS
+        value: ""
+      - key: TRIAL_ENFORCEMENT_ENABLED
+        value: "false"
+      - key: TRIAL_REQUESTS_PER_AGENT
+        value: "1"
+      - key: GATEWAY_MAX_UPLOAD_MB
+        value: "20"
+      - key: GATEWAY_MAX_DOCUMENTS_PER_USER
+        value: "10"
+      - key: GATEWAY_TIMEOUT_SECONDS
+        value: "180"
