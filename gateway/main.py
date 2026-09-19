@@ -75,7 +75,12 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
         app.state.client = client or httpx.AsyncClient(
             base_url=config.backend_url.rstrip('/'),
             headers={'X-Alectos-Gateway-Key': config.backend_gateway_secret},
-            timeout=httpx.Timeout(config.gateway_timeout_seconds, connect=10),
+            # A sleeping free-tier instance can take the better part of a minute to accept
+            # a connection. A short connect timeout turns that ordinary cold start into a
+            # 502 on the first request after an idle period, which is exactly when a user
+            # arrives. Allow for the wake-up, bounded by the overall request timeout.
+            timeout=httpx.Timeout(config.gateway_timeout_seconds,
+                                  connect=min(75, config.gateway_timeout_seconds)),
             limits=httpx.Limits(max_connections=30, max_keepalive_connections=10),
             follow_redirects=False,
         )
@@ -84,7 +89,12 @@ def create_gateway(settings=None, store=None, client=None, verifier=None):
         app.state.research = httpx.AsyncClient(
             base_url=config.research_backend_url.rstrip('/'),
             headers={'Authorization': f'Bearer {config.research_backend_api_key}'},
-            timeout=httpx.Timeout(config.gateway_timeout_seconds, connect=10),
+            # A sleeping free-tier instance can take the better part of a minute to accept
+            # a connection. A short connect timeout turns that ordinary cold start into a
+            # 502 on the first request after an idle period, which is exactly when a user
+            # arrives. Allow for the wake-up, bounded by the overall request timeout.
+            timeout=httpx.Timeout(config.gateway_timeout_seconds,
+                                  connect=min(75, config.gateway_timeout_seconds)),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=5),
             follow_redirects=False,
         ) if config.research_enabled else None
